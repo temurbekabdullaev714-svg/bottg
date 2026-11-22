@@ -9,6 +9,7 @@
     python bot.py
 """
 import asyncio
+import hashlib
 import html
 import json
 import logging
@@ -19,6 +20,7 @@ import uuid
 from pathlib import Path
 
 import aiohttp
+from aiohttp import web
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
@@ -26,6 +28,7 @@ from aiogram.filters import CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 from aiogram.types import (CallbackQuery, FSInputFile, InlineKeyboardButton,
                            InlineKeyboardMarkup, InputSticker, Message)
 from aiogram.utils.keyboard import InlineKeyboardBuilder
@@ -352,6 +355,7 @@ async def pinterest_fetch(url: str, tmp: Path):
                                  params={"data": q},
                                  headers={**UA, "X-Requested-With": "XMLHttpRequest",
                                           "Accept": "application/json"}) as r:
+                    logging.info("Pinterest JSON: HTTP %s", r.status)
                     j = await r.json(content_type=None)
                 d = (j.get("resource_response") or {}).get("data") or {}
                 video_url = best_video(find_all(d, "video_list"))
@@ -374,6 +378,21 @@ async def pinterest_fetch(url: str, tmp: Path):
             raw = og.group(1)
             image_urls += [re.sub(r"/\d+x/", "/originals/", raw), raw]
         image_urls += re.findall(r'https://i\.pinimg\.com/originals/[^"\\\s]+', page)[:1]
+
+        # 3.5. официальный oEmbed Pinterest (отдаёт хотя бы превью картинки)
+        try:
+            async with s.get("https://www.pinterest.com/oembed.json",
+                             params={"url": final}, headers=UA) as r:
+                logging.info("Pinterest oEmbed: HTTP %s", r.status)
+                oj = await r.json(content_type=None)
+            t = oj.get("thumbnail_url")
+            if t:
+                image_urls += [re.sub(r"/\d+x/", "/originals/", t), t]
+        except Exception as e:
+            logging.warning("Pinterest oEmbed не сработал: %r", e)
+
+        logging.info("Pinterest: final=%s page_len=%s id=%s video=%s images=%s",
+                     final, len(page), pin_id, bool(video_url), len(image_urls))
 
         # 4. скачиваем: видео в приоритете
         if video_url:
@@ -434,8 +453,30 @@ async def main():
     bot = Bot(TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
-    await bot.delete_webhook(drop_pending_updates=True)
-    await dp.start_polling(bot)
+
+    # На Render есть RENDER_EXTERNAL_URL -> работаем через webhook.
+    # Локально (без этой переменной) -> обычный polling.
+    base = os.getenv("RENDER_EXTERNAL_URL") or os.getenv("WEBHOOK_URL")
+    if not base:
+        await bot.delete_webhook(drop_pending_updates=True)
+        return await dp.start_polling(bot)
+
+    secret = hashlib.sha256(TOKEN.encode()).hexdigest()[:32]
+    path = "/webhook"
+
+    async def on_startup(bot: Bot):
+        await bot.set_webhook(base.rstrip("/") + path, secret_token=secret,
+                              drop_pending_updates=True)
+
+    dp.startup.register(on_startup)
+    app = web.Application()
+    app.router.add_get("/", lambda r: web.Response(text="ok"))
+    SimpleRequestHandler(dispatcher=dp, bot=bot, secret_token=secret).register(app, path=path)
+    setup_application(app, dp, bot=bot)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    await web.TCPSite(runner, "0.0.0.0", int(os.getenv("PORT", "10000"))).start()
+    await asyncio.Event().wait()
 
 
 if __name__ == "__main__":
