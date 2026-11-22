@@ -120,8 +120,10 @@ async def run(*cmd: str) -> int:
 
 
 async def download_url(session: aiohttp.ClientSession, url: str, dst: Path) -> bool:
-    async with session.get(url, headers=UA) as r:
+    headers = {**UA, "Referer": "https://www.pinterest.com/"}
+    async with session.get(url, headers=headers) as r:
         if r.status != 200:
+            logging.warning("Скачивание %s -> HTTP %s", url, r.status)
             return False
         dst.write_bytes(await r.read())
         return True
@@ -333,13 +335,37 @@ def best_video(video_lists) -> str | None:
     return hls[0]["url"] if hls else None
 
 
+def iter_dicts(obj):
+    if isinstance(obj, dict):
+        yield obj
+        for v in obj.values():
+            yield from iter_dicts(v)
+    elif isinstance(obj, list):
+        for v in obj:
+            yield from iter_dicts(v)
+
+
+def pin_from_page(raw: str, pin_id: str):
+    """Ищет данные пина в JSON, встроенном в HTML страницы."""
+    for m in re.finditer(r'<script[^>]*type="application/json"[^>]*>(.*?)</script>', raw, re.S):
+        try:
+            data = json.loads(m.group(1))
+        except Exception:
+            continue
+        for d in iter_dicts(data):
+            if str(d.get("id")) == pin_id and (
+                    "images" in d or "videos" in d or "story_pin_data" in d):
+                return d
+    return None
+
+
 async def pinterest_fetch(url: str, tmp: Path):
     """Возвращает (kind, path): kind = 'image' | 'video'."""
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60)) as s:
         # 1. раскрываем короткую ссылку, достаём id пина
         async with s.get(url, headers=UA, allow_redirects=True) as r:
-            final, page = str(r.url), await r.text()
-        page = html.unescape(page).replace("\\/", "/")
+            final, raw_page = str(r.url), await r.text()
+        page = html.unescape(raw_page).replace("\\/", "/")
         mid = (re.search(r"/pin/(?:[^/?]*--)?(\d+)", final)
                or re.search(r"/pin/(?:[^/?]*--)?(\d+)", url))
         pin_id = mid.group(1) if mid else None
@@ -366,6 +392,19 @@ async def pinterest_fetch(url: str, tmp: Path):
             except Exception as e:
                 logging.warning("Pinterest JSON не сработал: %r", e)
 
+        # 2.5. данные пина, встроенные в саму страницу
+        if pin_id and not video_url and not image_urls:
+            pin = pin_from_page(raw_page, pin_id)
+            if pin:
+                logging.info("Pinterest: пин найден в JSON страницы")
+                video_url = best_video(find_all(pin, "video_list"))
+                for o in find_all(pin, "orig"):
+                    if isinstance(o, dict) and o.get("url"):
+                        image_urls.insert(0, o["url"])
+                        break
+            else:
+                logging.warning("Pinterest: в JSON страницы пин %s не найден", pin_id)
+
         # 3. запасной путь: разбор HTML страницы
         if not video_url:
             vid = re.search(r'https://v\d*\.pinimg\.com/videos/[^"\\\s]+?\.mp4', page)
@@ -382,7 +421,7 @@ async def pinterest_fetch(url: str, tmp: Path):
         # 3.5. официальный oEmbed Pinterest (отдаёт хотя бы превью картинки)
         try:
             async with s.get("https://www.pinterest.com/oembed.json",
-                             params={"url": final}, headers=UA) as r:
+                             params={"url": f"https://www.pinterest.com/pin/{pin_id}/"}, headers=UA) as r:
                 logging.info("Pinterest oEmbed: HTTP %s", r.status)
                 oj = await r.json(content_type=None)
             t = oj.get("thumbnail_url")
