@@ -57,7 +57,8 @@ MENU_TEXT = (
     "Просто пришли мне что-нибудь — я сам пойму, что делать:\n\n"
     "🖼 <b>Фото</b> → стикер или целый пак\n"
     "🎞 <b>Видео</b> → GIF\n"
-    "📌 <b>Ссылка Pinterest</b> → PNG или MP4\n\n"
+    "📌 <b>Ссылка Pinterest</b> → PNG или MP4\n"
+    "🐦 <b>Ссылка X (Twitter)</b> → видео или GIF\n\n"
     "Или выбери действие ниже 👇"
 )
 
@@ -65,6 +66,8 @@ HINTS = {
     "sticker": "🖼 <b>Фото → стикер</b>\n\nПришли любое фото — получишь готовый стикер 512×512.",
     "gif": "🎞 <b>Видео → GIF</b>\n\nПришли видео (до ~15 сек работает лучше всего) — "
            "верну GIF-анимацию и файл .gif.",
+    "x": "🐦 <b>X (Twitter)</b>\n\nПришли ссылку на пост (x.com/…/status/… или twitter.com/…/status/…).\n"
+         "Верну видео или GIF из поста. Если в посте их нет или аккаунт закрытый — не получится.",
     "pin": "📌 <b>Pinterest</b>\n\nПришли ссылку на пин (pinterest.com/pin/… или pin.it/…).\n"
            "Фото придёт в <b>PNG</b>, видео — в <b>MP4</b>.",
 }
@@ -76,6 +79,7 @@ def main_kb() -> InlineKeyboardMarkup:
           InlineKeyboardButton(text="📦 Стикер-пак", callback_data="pack:new"))
     b.row(InlineKeyboardButton(text="🎞 Видео → GIF", callback_data="hint:gif"),
           InlineKeyboardButton(text="📌 Pinterest", callback_data="hint:pin"))
+    b.row(InlineKeyboardButton(text="🐦 X (Twitter)", callback_data="hint:x"))
     return b.as_markup()
 
 
@@ -119,8 +123,9 @@ async def run(*cmd: str) -> int:
     return await p.wait()
 
 
-async def download_url(session: aiohttp.ClientSession, url: str, dst: Path) -> bool:
-    headers = {**UA, "Referer": "https://www.pinterest.com/"}
+async def download_url(session: aiohttp.ClientSession, url: str, dst: Path,
+                       referer: str = "https://www.pinterest.com/") -> bool:
+    headers = {**UA, "Referer": referer}
     async with session.get(url, headers=headers) as r:
         if r.status != 200:
             logging.warning("Скачивание %s -> HTTP %s", url, r.status)
@@ -471,6 +476,70 @@ async def on_pinterest(m: Message):
                 return await status.edit_text(
                     "😔 Не нашёл медиа по этой ссылке (пин приватный или Pinterest "
                     "поменял страницу).", reply_markup=back_kb())
+        await status.edit_text("✅ Готово!", reply_markup=back_kb())
+    except Exception as e:
+        logging.exception(e)
+        await status.edit_text("😔 Ошибка при скачивании. Попробуй ещё раз.",
+                               reply_markup=back_kb())
+
+
+# ───────────────────────── X (Twitter) ─────────────────────────
+
+X_RE = re.compile(r"https?://(?:www\.|mobile\.)?(?:twitter\.com|x\.com|fxtwitter\.com|vxtwitter\.com)"
+                  r"/(\w+)/status(?:es)?/(\d+)", re.I)
+
+
+async def x_fetch(user: str, tid: str, tmp: Path):
+    """Возвращает список (kind, path), kind = 'gif' | 'video'."""
+    found = []
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=90)) as s:
+        try:
+            async with s.get(f"https://api.fxtwitter.com/{user}/status/{tid}", headers=UA) as r:
+                logging.info("fxtwitter: HTTP %s", r.status)
+                j = await r.json(content_type=None)
+            media = ((j.get("tweet") or {}).get("media") or {})
+            for it in media.get("all") or []:
+                if it.get("type") in ("video", "gif") and it.get("url"):
+                    found.append((it["type"], it["url"]))
+        except Exception as e:
+            logging.warning("fxtwitter не сработал: %r", e)
+        if not found:
+            try:
+                async with s.get(f"https://api.vxtwitter.com/{user}/status/{tid}", headers=UA) as r:
+                    logging.info("vxtwitter: HTTP %s", r.status)
+                    j = await r.json(content_type=None)
+                for it in j.get("media_extended") or []:
+                    if it.get("type") in ("video", "gif") and it.get("url"):
+                        found.append((it["type"], it["url"]))
+            except Exception as e:
+                logging.warning("vxtwitter не сработал: %r", e)
+        results = []
+        for i, (kind, u) in enumerate(found[:4]):
+            f = tmp / f"x{i}.mp4"
+            if await download_url(s, u, f, referer="https://x.com/"):
+                results.append((kind, f))
+    return results
+
+
+@router.message(F.text.regexp(X_RE))
+async def on_x(m: Message):
+    mm = X_RE.search(m.text)
+    status = await m.reply("⏳ Достаю из X…")
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            items = await x_fetch(mm.group(1), mm.group(2), Path(tmp))
+            if not items:
+                return await status.edit_text(
+                    "😔 Не нашёл видео или GIF в этом посте (их там нет, аккаунт "
+                    "закрыт или пост удалён).", reply_markup=back_kb())
+            for kind, path in items:
+                if path.stat().st_size > 49 * 1024 * 1024:
+                    await m.answer("😔 Видео больше 50 МБ, Telegram не даёт отправить его ботом.")
+                    continue
+                if kind == "gif":
+                    await m.answer_animation(FSInputFile(path))
+                else:
+                    await m.answer_video(FSInputFile(path), supports_streaming=True)
         await status.edit_text("✅ Готово!", reply_markup=back_kb())
     except Exception as e:
         logging.exception(e)
