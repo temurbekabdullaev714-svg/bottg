@@ -56,7 +56,7 @@ MENU_TEXT = (
     "✨ <b>Мастерская стикеров и медиа</b>\n\n"
     "Просто пришли мне что-нибудь — я сам пойму, что делать:\n\n"
     "🖼 <b>Фото</b> → стикер или целый пак\n"
-    "🎞 <b>Видео</b> → GIF\n"
+    "🎭 <b>Видео</b> → анимированный стикер, пак или GIF\n"
     "📌 <b>Ссылка Pinterest</b> → PNG или MP4\n"
     "🐦 <b>Ссылка X (Twitter)</b> → видео или GIF\n\n"
     "Или выбери действие ниже 👇"
@@ -64,6 +64,9 @@ MENU_TEXT = (
 
 HINTS = {
     "sticker": "🖼 <b>Фото → стикер</b>\n\nПришли любое фото — получишь готовый стикер 512×512.",
+    "vsticker": "🎭 <b>Видео → стикер</b>\n\nПришли видео или GIF — сделаю из него "
+                "<b>движущийся стикер</b> (в стикер попадают первые 3 секунды, "
+                "это правило Telegram) или целый видео-пак.",
     "gif": "🎞 <b>Видео → GIF</b>\n\nПришли видео (до ~15 сек работает лучше всего) — "
            "верну GIF-анимацию и файл .gif.",
     "x": "🐦 <b>X (Twitter)</b>\n\nПришли ссылку на пост (x.com/…/status/… или twitter.com/…/status/…).\n"
@@ -76,10 +79,11 @@ HINTS = {
 def main_kb() -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     b.row(InlineKeyboardButton(text="🖼 Фото → стикер", callback_data="hint:sticker"),
-          InlineKeyboardButton(text="📦 Стикер-пак", callback_data="pack:new"))
+          InlineKeyboardButton(text="🎭 Видео → стикер", callback_data="hint:vsticker"))
     b.row(InlineKeyboardButton(text="🎞 Видео → GIF", callback_data="hint:gif"),
-          InlineKeyboardButton(text="📌 Pinterest", callback_data="hint:pin"))
-    b.row(InlineKeyboardButton(text="🐦 X (Twitter)", callback_data="hint:x"))
+          InlineKeyboardButton(text="📦 Стикер-пак", callback_data="pack:new"))
+    b.row(InlineKeyboardButton(text="📌 Pinterest", callback_data="hint:pin"),
+          InlineKeyboardButton(text="🐦 X (Twitter)", callback_data="hint:x"))
     return b.as_markup()
 
 
@@ -134,7 +138,14 @@ async def download_url(session: aiohttp.ClientSession, url: str, dst: Path,
         return True
 
 
-# ───────────────────────── Фото → стикер ─────────────────────────
+# ───────────────────────── Стикеры: фото и видео ─────────────────────────
+
+MAX_DL = 20 * 1024 * 1024  # лимит Telegram на скачивание файла ботом
+
+
+class MixError(Exception):
+    pass
+
 
 def photo_kb() -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
@@ -143,35 +154,96 @@ def photo_kb() -> InlineKeyboardMarkup:
     return b.as_markup()
 
 
-@router.message(Pack.collecting, F.photo)
-async def pack_add_photo(m: Message, state: FSMContext, bot: Bot):
-    data = await state.get_data()
+def video_kb() -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    b.row(InlineKeyboardButton(text="🎭 Видео-стикер", callback_data="video:single"),
+          InlineKeyboardButton(text="📦 В новый пак", callback_data="video:pack"))
+    b.row(InlineKeyboardButton(text="🎞 В GIF", callback_data="video:gif"))
+    return b.as_markup()
+
+
+def media_of(msg: Message):
+    """Возвращает (kind, file_id, size) для фото или видео/GIF, иначе None."""
+    if msg is None:
+        return None
+    if msg.photo:
+        return "photo", msg.photo[-1].file_id, msg.photo[-1].file_size
+    v = msg.video or msg.animation
+    if v:
+        return "video", v.file_id, v.file_size
+    return None
+
+
+async def to_video_sticker(src: Path, dst: Path) -> bool:
+    """Видео → WEBM VP9 по правилам Telegram: сторона 512, до 3 сек, без звука, до 256 КБ."""
+    for br in (500, 300, 180, 100):
+        code = await run(
+            FFMPEG, "-y", "-i", str(src), "-t", "3", "-an",
+            "-vf", "scale=512:512:force_original_aspect_ratio=decrease,fps=30",
+            "-c:v", "libvpx-vp9", "-pix_fmt", "yuva420p",
+            "-b:v", f"{br}k", "-maxrate", f"{br}k", "-bufsize", f"{br * 2}k",
+            "-auto-alt-ref", "0", "-deadline", "good", "-cpu-used", "5", str(dst))
+        if code == 0 and dst.exists() and dst.stat().st_size <= 256 * 1024:
+            return True
+    return False
+
+
+async def build_sticker(bot: Bot, kind: str, file_id: str, tmp: Path):
+    """Скачивает файл и готовит стикер. Возвращает (путь, формат)."""
+    if kind == "photo":
+        src, dst = tmp / "in.jpg", tmp / "s.webp"
+        await bot.download(file_id, destination=src)
+        to_sticker_webp(src, dst)
+        return dst, "static"
+    src, dst = tmp / "in.mp4", tmp / "s.webm"
+    await bot.download(file_id, destination=src)
+    if not await to_video_sticker(src, dst):
+        raise RuntimeError("не удалось собрать видео-стикер")
+    return dst, "video"
+
+
+async def put_in_pack(bot: Bot, user_id: int, data: dict, kind: str, file_id: str) -> str:
+    """Добавляет стикер в пак (создаёт пак при первом). Возвращает формат пака."""
+    want = "static" if kind == "photo" else "video"
+    if data.get("fmt") and data["fmt"] != want:
+        raise MixError()
+    with tempfile.TemporaryDirectory() as tmp:
+        path, fmt = await build_sticker(bot, kind, file_id, Path(tmp))
+        st = InputSticker(sticker=FSInputFile(path), format=fmt, emoji_list=["😀"])
+        if data.get("count", 0) == 0:
+            await bot.create_new_sticker_set(
+                user_id=user_id, name=data["name"], title=data["title"], stickers=[st])
+        else:
+            await bot.add_sticker_to_set(user_id=user_id, name=data["name"], sticker=st)
+    return fmt
+
+
+@router.message(Pack.collecting, F.photo | F.video | F.animation)
+async def pack_add(m: Message, state: FSMContext, bot: Bot):
+    kind, file_id, size = media_of(m)
+    if kind == "video" and size and size > MAX_DL:
+        return await m.answer("😔 Видео больше 20 МБ — Telegram не даёт боту его скачать.",
+                              reply_markup=pack_done_kb())
     lock = locks.setdefault(m.from_user.id, asyncio.Lock())
     async with lock:
         data = await state.get_data()
         status = await m.answer("⏳ Добавляю в пак…")
         try:
-            with tempfile.TemporaryDirectory() as tmp:
-                src, dst = Path(tmp) / "in.jpg", Path(tmp) / "s.webp"
-                await bot.download(m.photo[-1].file_id, destination=src)
-                to_sticker_webp(src, dst)
-                st = InputSticker(sticker=FSInputFile(dst), format="static",
-                                  emoji_list=["😀"])
-                if data.get("count", 0) == 0:
-                    await bot.create_new_sticker_set(
-                        user_id=m.from_user.id, name=data["name"],
-                        title=data["title"], stickers=[st])
-                else:
-                    await bot.add_sticker_to_set(
-                        user_id=m.from_user.id, name=data["name"], sticker=st)
+            fmt = await put_in_pack(bot, m.from_user.id, data, kind, file_id)
             count = data.get("count", 0) + 1
-            await state.update_data(count=count)
+            await state.update_data(count=count, fmt=fmt)
+            more = "фото" if fmt == "static" else "видео"
             await status.edit_text(
-                f"✅ Стикер №{count} добавлен!\nПришли ещё фото или нажми «Готово».",
+                f"✅ Стикер №{count} добавлен!\nПришли ещё {more} или нажми «Готово».",
+                reply_markup=pack_done_kb())
+        except MixError:
+            await status.edit_text(
+                "⚠️ В одном паке нельзя смешивать фото- и видео-стикеры. "
+                "Пришли такой же тип, как первый стикер, или нажми «Готово».",
                 reply_markup=pack_done_kb())
         except Exception as e:
             logging.exception(e)
-            await status.edit_text("😔 Не получилось добавить. Попробуй другое фото.",
+            await status.edit_text("😔 Не получилось добавить. Попробуй другой файл.",
                                    reply_markup=pack_done_kb())
 
 
@@ -180,23 +252,27 @@ async def on_photo(m: Message):
     await m.reply("Что сделать с этим фото?", reply_markup=photo_kb())
 
 
-@router.callback_query(F.data == "photo:single")
+@router.callback_query(F.data.in_({"photo:single", "video:single"}))
 async def cb_single(c: CallbackQuery, bot: Bot):
-    src_msg = c.message.reply_to_message
-    if not src_msg or not src_msg.photo:
-        return await c.answer("Пришли фото ещё раз 🙏", show_alert=True)
+    info = media_of(c.message.reply_to_message)
+    want = "photo" if c.data == "photo:single" else "video"
+    if not info or info[0] != want:
+        return await c.answer("Пришли файл ещё раз 🙏", show_alert=True)
+    kind, file_id, size = info
+    if kind == "video" and size and size > MAX_DL:
+        return await c.answer("Видео больше 20 МБ — Telegram не даёт его скачать.",
+                              show_alert=True)
     await c.message.edit_text("⏳ Делаю стикер…")
     try:
         with tempfile.TemporaryDirectory() as tmp:
-            src, dst = Path(tmp) / "in.jpg", Path(tmp) / "s.webp"
-            await bot.download(src_msg.photo[-1].file_id, destination=src)
-            to_sticker_webp(src, dst)
-            await c.message.answer_sticker(FSInputFile(dst))
-        await c.message.edit_text("✅ Готово! Перешли стикер в «Избранное», чтобы сохранить.",
-                                  reply_markup=back_kb())
+            path, _ = await build_sticker(bot, kind, file_id, Path(tmp))
+            await c.message.answer_sticker(FSInputFile(path))
+        await c.message.edit_text(
+            "✅ Готово! Перешли стикер в «Избранное», чтобы сохранить.",
+            reply_markup=back_kb())
     except Exception as e:
         logging.exception(e)
-        await c.message.edit_text("😔 Не получилось. Попробуй другое фото.",
+        await c.message.edit_text("😔 Не получилось. Попробуй другой файл.",
                                   reply_markup=back_kb())
     await c.answer()
 
@@ -220,16 +296,22 @@ async def cb_pack_new(c: CallbackQuery, state: FSMContext):
     await c.answer()
 
 
-@router.callback_query(F.data == "photo:pack")
-async def cb_photo_pack(c: CallbackQuery, state: FSMContext):
-    src_msg = c.message.reply_to_message
-    if not src_msg or not src_msg.photo:
-        return await c.answer("Пришли фото ещё раз 🙏", show_alert=True)
+@router.callback_query(F.data.in_({"photo:pack", "video:pack"}))
+async def cb_media_pack(c: CallbackQuery, state: FSMContext):
+    info = media_of(c.message.reply_to_message)
+    want = "photo" if c.data == "photo:pack" else "video"
+    if not info or info[0] != want:
+        return await c.answer("Пришли файл ещё раз 🙏", show_alert=True)
+    kind, file_id, size = info
+    if kind == "video" and size and size > MAX_DL:
+        return await c.answer("Видео больше 20 МБ — Telegram не даёт его скачать.",
+                              show_alert=True)
     await state.clear()
-    await state.update_data(first=src_msg.photo[-1].file_id)
+    await state.update_data(first=file_id, first_kind=kind)
     await state.set_state(Pack.title)
+    what = "фото" if kind == "photo" else "видео"
     await c.message.edit_text(
-        "📦 <b>Новый стикер-пак</b>\n\nЭто фото станет первым стикером.\n"
+        f"📦 <b>Новый стикер-пак</b>\n\nЭто {what} станет первым стикером.\n"
         "Напиши название пака (до 64 символов).", reply_markup=back_kb())
     await c.answer()
 
@@ -241,30 +323,27 @@ async def pack_title(m: Message, state: FSMContext, bot: Bot):
     name = f"p{uuid.uuid4().hex[:10]}_by_{me.username}"
     data = await state.get_data()
     await state.set_state(Pack.collecting)
-    await state.update_data(title=title, name=name, count=0)
+    await state.update_data(title=title, name=name, count=0, fmt=None)
     if data.get("first"):
         # первый стикер уже есть — создаём пак сразу
         status = await m.answer("⏳ Создаю пак…")
         try:
-            with tempfile.TemporaryDirectory() as tmp:
-                src, dst = Path(tmp) / "in.jpg", Path(tmp) / "s.webp"
-                await bot.download(data["first"], destination=src)
-                to_sticker_webp(src, dst)
-                await bot.create_new_sticker_set(
-                    user_id=m.from_user.id, name=name, title=title,
-                    stickers=[InputSticker(sticker=FSInputFile(dst), format="static",
-                                           emoji_list=["😀"])])
-            await state.update_data(count=1)
+            cur = {"title": title, "name": name, "count": 0, "fmt": None}
+            fmt = await put_in_pack(bot, m.from_user.id, cur, data["first_kind"], data["first"])
+            await state.update_data(count=1, fmt=fmt)
+            more = "фото" if fmt == "static" else "видео"
             await status.edit_text(
                 f"✅ Пак «{html.escape(title)}» создан, стикер №1 добавлен!\n"
-                "Пришли ещё фото или нажми «Готово».", reply_markup=pack_done_kb())
+                f"Пришли ещё {more} или нажми «Готово».", reply_markup=pack_done_kb())
         except Exception as e:
             logging.exception(e)
             await state.clear()
             await status.edit_text("😔 Не получилось создать пак.", reply_markup=back_kb())
     else:
-        await m.answer(f"📦 Пак «{html.escape(title)}»\n\nТеперь присылай фото — "
-                       "каждое станет стикером.", reply_markup=pack_done_kb())
+        await m.answer(f"📦 Пак «{html.escape(title)}»\n\nТеперь присылай <b>фото</b> "
+                       "(обычные стикеры) или <b>видео</b> (движущиеся стикеры). "
+                       "Тип первого стикера станет типом всего пака.",
+                       reply_markup=pack_done_kb())
 
 
 @router.callback_query(F.data == "pack:done")
@@ -284,19 +363,29 @@ async def cb_pack_done(c: CallbackQuery, state: FSMContext):
     await c.answer()
 
 
-# ───────────────────────── Видео → GIF ─────────────────────────
+# ───────────────────────── Видео: выбор действия и GIF ─────────────────────────
 
 @router.message(F.video | F.animation)
-async def on_video(m: Message, bot: Bot):
-    media = m.video or m.animation
-    if media.file_size and media.file_size > 20 * 1024 * 1024:
-        return await m.reply("😔 Видео больше 20 МБ — Telegram не даёт боту его скачать.")
-    status = await m.reply("⏳ Превращаю в GIF…")
+async def on_video(m: Message):
+    await m.reply("Что сделать с этим видео?", reply_markup=video_kb())
+
+
+@router.callback_query(F.data == "video:gif")
+async def cb_gif(c: CallbackQuery, bot: Bot):
+    info = media_of(c.message.reply_to_message)
+    if not info or info[0] != "video":
+        return await c.answer("Пришли видео ещё раз 🙏", show_alert=True)
+    _, file_id, size = info
+    if size and size > MAX_DL:
+        return await c.answer("Видео больше 20 МБ — Telegram не даёт его скачать.",
+                              show_alert=True)
+    reply_to = c.message.reply_to_message
+    await c.message.edit_text("⏳ Превращаю в GIF…")
     try:
         with tempfile.TemporaryDirectory() as tmp:
             src = Path(tmp) / "in.mp4"
             mp4, gif = Path(tmp) / "out.mp4", Path(tmp) / "out.gif"
-            await bot.download(media.file_id, destination=src)
+            await bot.download(file_id, destination=src)
             c1 = await run(FFMPEG, "-y", "-i", str(src), "-t", "15", "-an",
                            "-vf", "scale=480:-2", "-c:v", "libx264",
                            "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(mp4))
@@ -305,13 +394,14 @@ async def on_video(m: Message, bot: Bot):
                            "[a]palettegen[p];[b][p]paletteuse", str(gif))
             if c1 != 0 or c2 != 0:
                 raise RuntimeError("ffmpeg failed")
-            await m.answer_animation(FSInputFile(mp4))
-            await m.answer_document(FSInputFile(gif), caption="📎 Файл .gif")
-        await status.edit_text("✅ Готово!", reply_markup=back_kb())
+            await reply_to.answer_animation(FSInputFile(mp4))
+            await reply_to.answer_document(FSInputFile(gif), caption="📎 Файл .gif")
+        await c.message.edit_text("✅ Готово!", reply_markup=back_kb())
     except Exception as e:
         logging.exception(e)
-        await status.edit_text("😔 Не получилось. Попробуй другое видео.",
-                               reply_markup=back_kb())
+        await c.message.edit_text("😔 Не получилось. Попробуй другое видео.",
+                                  reply_markup=back_kb())
+    await c.answer()
 
 
 # ───────────────────────── Pinterest ─────────────────────────
