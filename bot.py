@@ -57,7 +57,7 @@ MENU_TEXT = (
     "✨ <b>Мастерская стикеров и медиа</b>\n\n"
     "Просто пришли мне что-нибудь — я сам пойму, что делать:\n\n"
     "🖼 <b>Фото</b> → стикер или целый пак\n"
-    "🎭 <b>Видео</b> → анимированный стикер, пак или GIF\n"
+    "🎭 <b>Видео</b> → анимированный стикер, пак, GIF или кружок\n"
     "📌 <b>Ссылка Pinterest</b> → PNG или MP4\n"
     "🐦 <b>Ссылка X (Twitter)</b> → видео или GIF\n"
     "▶️ <b>Ссылка YouTube / Shorts</b> → видео или аудио\n\n"
@@ -68,7 +68,7 @@ HINTS = {
     "sticker": "🖼 <b>Фото → стикер</b>\n\nПришли любое фото — получишь готовый стикер 512×512.",
     "vsticker": "🎭 <b>Видео → стикер</b>\n\nПришли видео или GIF — сделаю из него "
                 "<b>движущийся стикер</b> (в стикер попадают первые 3 секунды, "
-                "это правило Telegram) или целый видео-пак.",
+                "это правило Telegram) или целый видео-пак.\n⭕ Ещё можно превратить видео в <b>кружок</b> (до 60 сек).",
     "gif": "🎞 <b>Видео → GIF</b>\n\nПришли видео (до ~15 сек работает лучше всего) — "
            "верну GIF-анимацию и файл .gif.",
     "x": "🐦 <b>X (Twitter)</b>\n\nПришли ссылку на пост (x.com/…/status/… или twitter.com/…/status/…).\n"
@@ -164,7 +164,8 @@ def video_kb() -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     b.row(InlineKeyboardButton(text="🎭 Видео-стикер", callback_data="video:single"),
           InlineKeyboardButton(text="📦 В новый пак", callback_data="video:pack"))
-    b.row(InlineKeyboardButton(text="🎞 В GIF", callback_data="video:gif"))
+    b.row(InlineKeyboardButton(text="🎞 В GIF", callback_data="video:gif"),
+          InlineKeyboardButton(text="⭕ Кружок", callback_data="video:circle"))
     return b.as_markup()
 
 
@@ -402,6 +403,44 @@ async def cb_gif(c: CallbackQuery, bot: Bot):
                 raise RuntimeError("ffmpeg failed")
             await reply_to.answer_animation(FSInputFile(mp4))
             await reply_to.answer_document(FSInputFile(gif), caption="📎 Файл .gif")
+        await c.message.edit_text("✅ Готово!", reply_markup=back_kb())
+    except Exception as e:
+        logging.exception(e)
+        await c.message.edit_text("😔 Не получилось. Попробуй другое видео.",
+                                  reply_markup=back_kb())
+    await c.answer()
+
+
+# ───────────────────────── Видео → кружок ─────────────────────────
+
+@router.callback_query(F.data == "video:circle")
+async def cb_circle(c: CallbackQuery, bot: Bot):
+    info = media_of(c.message.reply_to_message)
+    if not info or info[0] != "video":
+        return await c.answer("Пришли видео ещё раз 🙏", show_alert=True)
+    _, file_id, size = info
+    if size and size > MAX_DL:
+        return await c.answer("Видео больше 20 МБ — Telegram не даёт его скачать.",
+                              show_alert=True)
+    await c.message.edit_text("⏳ Делаю кружок…")
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            src, dst = Path(tmp) / "in.mp4", Path(tmp) / "circle.mp4"
+            await bot.download(file_id, destination=src)
+            ok = False
+            for side, crf in ((640, 26), (480, 30), (384, 34)):
+                code = await run(
+                    FFMPEG, "-y", "-i", str(src), "-t", "60",
+                    "-vf", f"crop=w='min(iw,ih)':h='min(iw,ih)',scale={side}:{side}",
+                    "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "veryfast",
+                    "-crf", str(crf), "-c:a", "aac", "-b:a", "96k",
+                    "-movflags", "+faststart", str(dst))
+                if code == 0 and dst.exists() and dst.stat().st_size <= 10 * 1024 * 1024:
+                    ok = True
+                    break
+            if not ok:
+                raise RuntimeError("не удалось собрать кружок")
+            await c.message.answer_video_note(FSInputFile(dst), length=side)
         await c.message.edit_text("✅ Готово!", reply_markup=back_kb())
     except Exception as e:
         logging.exception(e)
